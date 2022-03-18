@@ -1,0 +1,283 @@
+#! /bin/sh
+# Copyright (C) 2009, 2010, 2011, 2012, 2013, 2014, 2016, 2017 Nicira, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Includes Inango Systems Ltd’s changes/modifications dated: 2021.
+# Changed/modified portions - Copyright (c) 2021 , Inango Systems Ltd.
+#
+
+case $0 in
+    */*) dir0=`echo "$0" | sed 's,/[^/]*$,,'` ;;
+    *) dir0=./ ;;
+esac
+
+. "$dir0/ovs-lib" || exit 1
+
+do_start_brcompatd () {
+    insert_kmods_if_required || return 1
+
+    if daemon_is_running ovs-brcompatd; then
+        log_success_msg "ovs-brcompatd is already running"
+    else
+        # Start ovs-brcompatd.
+        set ovs-brcompatd
+        if test X"$SELF_CONFINEMENT" = Xno; then
+            set "$@" --no-self-confinement
+        fi
+        [ "$OVS_USER" != "" ] && set "$@" --user "$OVS_USER"
+
+        start_daemon "$OVS_BRCOMPATD_PRIORITY" "$OVS_BRCOMPATD_WRAPPER" "$@" ||
+            return 1
+
+        action "Enabling proactive mode" \
+            ovs-appctl upcall/enable-proactive-mode
+
+        action "Set tcp flags always wildcards" \
+            ovs-appctl upcall/enable-megaflows-mask-fields tcp_flags
+
+        action "Disabling megaflows in OVS datapath" \
+            ovs-appctl upcall/disable-megaflows
+
+        action "Disabling the flow hardware offload" \
+            ovs-vsctl set Open_vSwitch . other_config:hw-offload=false
+
+        action "Set max-revalidator time to 2000ms" \
+            ovs-vsctl --no-wait set Open_vSwitch . other_config:max-revalidator=2000
+    fi
+}
+
+start_brcompatd () {
+    if test X"$OVS_BRCOMPATD" = Xyes; then
+        do_start_brcompatd || return 1
+        touch /tmp/inangoplug_started
+    fi
+
+    return 0
+}
+
+stop_brcompatd () {
+    if test X"$OVS_BRCOMPATD" = Xyes; then
+        stop_daemon ovs-brcompatd
+        remove_kmods
+        rm -f /tmp/inangoplug_started
+    fi
+}
+
+restart_brcompatd () {
+    stop_brcompatd
+    start_brcompatd || return 1
+}
+
+insert_brc_mods () {
+    if test -e /sys/module/bridge; then
+        # Try loading brcompat kernel module.
+        if test X"$OVS_BRIDGES" != X; then
+            action "Inserting openvswitch module" modprobe brcompat bridges=$OVS_BRIDGES
+        else
+            action "Inserting openvswitch module" modprobe brcompat
+        fi
+    else
+        log_failure_msg "You need to load the Linux bridge module before the brcompat module will be loaded."
+        return 1
+    fi
+}
+
+insert_kmods_if_required () {
+    # If this kernel has no module support, expect we're done.
+    if test ! -e /proc/modules; then
+        log_success_msg "Kernel has no loadable module support. Skipping modprobe"
+        return 0
+    fi
+
+    # If brcompat is already loaded then we're done.
+    if ! test -e /sys/module/brcompat; then
+        # Load brcompat.  If that's successful then we're done.
+        insert_brc_mods || return 1
+    fi
+
+    return 0
+}
+
+remove_kmods() {
+    if test -e /sys/module/brcompat; then
+        action "Removing openvswitch module" rmmod brcompat
+    fi
+}
+
+force_reload_kmod () {
+    remove_kmods
+
+    # Restart the ovs-brcompatd
+    stop_brcompatd
+    start_brcompatd || return 1
+
+    insert_kmods_if_required
+}
+
+set_defaults () {
+    DAEMON_CWD=/
+
+    MONITOR=yes
+    OVS_USER=
+
+    OVS_BRCOMPATD=yes
+    OVS_BRCOMPATD_PRIORITY=-10
+    OVS_BRCOMPATD_WRAPPER=
+    OVS_BRIDGES=
+}
+
+usage () {
+    set_defaults
+    cat <<EOF
+$0: controls ovs-brcompat daemon
+usage: $0 [OPTIONS] COMMAND
+
+This program is intended to be invoked internally by startup scripts. System
+administrators should not normally invoke it directly.
+
+Commands:
+  start                   start ovs-brcompat daemon
+  stop                    stop ovs-brcompat daemon
+  restart                 stop and start ovs-brcompat daemon
+  status                  check whether ovs-brcompat daemon is running
+  version                 print versions of ovs-brcompat daemon
+  load-kmod               insert modules if not already present
+
+  force-reload-kmod       stop ovs-brcompat, unload kernel module, reload kernel module,
+                          start ovs-brcompat
+
+  help                    display this help message
+
+Important options for "start", "restart" and "force-reload-kmod":
+  --ovs-user="user[:group]"  pass the --user flag to ovs daemons
+
+Less important options for "start", "restart" and "force-reload-kmod":
+  --daemon-cwd=DIR               set working dir for OVS daemons (default: $DAEMON_CWD)
+  --no-force-corefiles           do not force on core dumps for OVS daemons
+
+Other options:
+  -h, --help                  display this help message
+  -V, --version               display version information
+
+Please report bugs to bugs@openvswitch.org (see REPORTING-BUGS for details).
+EOF
+
+    exit 0
+}
+
+set_option () {
+    var=`echo "$option" | tr abcdefghijklmnopqrstuvwxyz- ABCDEFGHIJKLMNOPQRSTUVWXYZ_`
+    eval set=\${$var+yes}
+    eval old_value=\$$var
+    if test X$set = X || \
+        (test $type = bool && \
+        test X"$old_value" != Xno && test X"$old_value" != Xyes); then
+        echo >&2 "$0: unknown option \"$arg\" (use --help for help)"
+        return
+    fi
+    eval $var=\$value
+}
+
+daemons () {
+    echo ovs-brcompatd
+}
+
+
+set_defaults
+
+command=
+
+for arg
+do
+    case $arg in
+        -h | --help)
+            usage
+            ;;
+        -V | --version)
+            echo "$0 (Open vSwitch) $VERSION"
+            exit 0
+            ;;
+        --[a-z]*=*)
+            option=`expr X"$arg" : 'X--\([^=]*\)'`
+            value=`expr X"$arg" : 'X[^=]*=\(.*\)'`
+            type=string
+            set_option
+            ;;
+        --no-[a-z]*)
+            option=`expr X"$arg" : 'X--no-\(.*\)'`
+            value=no
+            type=bool
+            set_option
+            ;;
+        --[a-z]*)
+            option=`expr X"$arg" : 'X--\(.*\)'`
+            value=yes
+            type=bool
+            set_option
+            ;;
+        -*)
+            echo >&2 "$0: unknown option \"$arg\" (use --help for help)"
+            exit 1
+            ;;
+        *)
+            if test X"$command" = X; then
+                command=$arg
+            else
+                echo >&2 "$0: exactly one non-option argument required (use --help for help)"
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+case $command in
+    start)
+        start_brcompatd || exit 1
+        ;;
+    stop)
+        stop_brcompatd
+        ;;
+    restart)
+        restart_brcompatd
+        ;;
+    status)
+        rc=0
+        for daemon in `daemons`; do
+            daemon_status $daemon || rc=$?
+        done
+        exit $rc
+        ;;
+    version)
+        for daemon in `daemons`; do
+            $daemon --version
+        done
+        ;;
+    force-reload-kmod)
+        force_reload_kmod
+        ;;
+    load-kmod)
+        insert_kmods_if_required
+        ;;
+    help)
+        usage
+        ;;
+    '')
+        echo >&2 "$0: missing command name (use --help for help)"
+        exit 1
+        ;;
+    *)
+        echo >&2 "$0: unknown command \"$command\" (use --help for help)"
+        exit 1
+        ;;
+esac

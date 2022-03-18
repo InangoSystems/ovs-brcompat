@@ -1,0 +1,8 @@
+\.am$
+\.m4$
+\.mk$
+\.png$
+\.sln$
+^datapath/
+^include/linux/
+^build-aux/

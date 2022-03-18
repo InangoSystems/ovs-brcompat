@@ -1,0 +1,33 @@
+# -*- makefile -*-
+export builddir = @abs_builddir@
+export KSRC = @KBUILD@
+export srcdir = @abs_srcdir@
+export top_srcdir = @abs_top_srcdir@
+export VERSION = @VERSION@
+
+include $(srcdir)/../Modules.mk
+include $(srcdir)/Modules.mk
+
+ccflags-y := -DVERSION=\"$(VERSION)\"
+ccflags-y += -I$(KSRC)/source/net/openvswitch
+ccflags-y += -I$(KSRC)/source/include
+ccflags-y += -I$(srcdir)/..
+ccflags-y += -I$(builddir)/..
+ccflags-y += -I$(srcdir)/compat
+ccflags-y += -g
+ccflags-y += -include $(builddir)/kcompat.h
+ccflags-y += -I$(PKG_CONFIG_SYSROOT_DIR)/$(includedir)/
+ccflags-y += -Wno-error -Wno-error=incompatible-pointer-types -Wno-return-type -Wno-implicit-fallthrough -Wno-unused-function
+
+# These include directories have to go before -I$(KSRC)/include.
+# NOSTDINC_FLAGS just happens to be a variable that goes in the
+# right place, even though it's conceptually incorrect.
+NOSTDINC_FLAGS += -Wno-error -Wno-error=return-type -Wno-implicit-fallthrough -Wno-error=incompatible-pointer-types -I$(top_srcdir)/include -I$(KSRC)/net/openvswitch
+
+obj-m := $(subst _,-,$(patsubst %,%.o,$(build_modules)))
+
+define module_template
+$(1)-y = $$(notdir $$(patsubst %.c,%.o,$($(1)_sources)))
+endef
+
+$(foreach module,$(build_multi_modules),$(eval $(call module_template,$(module))))
