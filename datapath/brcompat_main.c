@@ -41,6 +41,7 @@
 #include "datapath.h"
 #include "openvswitch/brcompat-netlink.h"
 #include "vport-internal_dev.h"
+#include "vport-netdev.h"
 
 #ifdef HAVE_GENL_MULTICAST_GROUP_WITH_ID
 #define GROUP_ID(grp)	((grp)->id)
@@ -906,7 +907,11 @@ static int brc_dev_sysfs(struct net_device *dev, unsigned long *ul_value, int cm
 {
 	int err = 0;
 #if IS_ENABLED(CONFIG_BRIDGE)
-	struct vport *vport = ovs_internal_dev_get_vport(dev);
+	struct vport *vport = NULL;
+	if (netif_is_ovs_master(dev))
+		vport = ovs_internal_dev_get_vport(dev);
+	else if (netif_is_ovs_port(dev))
+		vport = ovs_netdev_get_vport(dev);
 #endif
 
 	if (oper == GET_PARAMETER)
@@ -988,6 +993,10 @@ static int brc_dev_sysfs(struct net_device *dev, unsigned long *ul_value, int cm
 				case IFLA_BRPORT_FAST_LEAVE:
 					if (vport && vport->brcompat_data)
 						br_compat_get_port_flag(vport->brcompat_data, ul_value, BR_MULTICAST_FAST_LEAVE);
+					break;
+				case IFLA_BRPORT_MODE:
+					if (vport && vport->brcompat_data)
+						br_compat_get_port_flag(vport->brcompat_data, ul_value, BR_HAIRPIN_MODE);
 					break;
 #endif
 				case IFLA_BRPORT_NO:
@@ -1081,6 +1090,15 @@ static int brc_dev_sysfs(struct net_device *dev, unsigned long *ul_value, int cm
 						if (vport && vport->brcompat_data)
 							br_compat_set_port_flag(vport->brcompat_data, *ul_value, BR_MULTICAST_FAST_LEAVE);
 					}
+#endif
+					dev_put(dev);
+					break;
+				case IFLA_BRPORT_MODE:
+					dev_hold(dev);
+					err = brc_set_ulong_val_cmd(dev, BRC_GENL_C_SET_PORT_HAIRPIN_MODE, *ul_value);
+#if IS_ENABLED(CONFIG_BRIDGE)
+					if (vport && vport->brcompat_data)
+						br_compat_set_port_flag(vport->brcompat_data, *ul_value, BR_HAIRPIN_MODE);
 #endif
 					dev_put(dev);
 					break;
@@ -1250,6 +1268,9 @@ static struct genl_ops brc_genl_ops[] = {
 	  .flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN privelege. */
 	  .policy = brc_genl_policy,
 	  .doit = brc_genl_dp_result,
+#ifdef HAVE_GENL_VALIDATE_FLAGS
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+#endif
 	},
 };
 
@@ -1313,8 +1334,13 @@ static struct sk_buff *brc_send_command(struct net *net,
 
 	/* Re-parse message.  Can't fail, since it parsed correctly once
 	 * already. */
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(5,1,21)
 	error = genlmsg_parse(nlmsg_hdr(reply), &brc_genl_family,
 			    attrs, BRC_GENL_A_MAX, brc_genl_policy, NULL);
+#else
+	error = genlmsg_parse_deprecated(nlmsg_hdr(reply), &brc_genl_family,
+			    attrs, BRC_GENL_A_MAX, brc_genl_policy, NULL);
+#endif
 	WARN_ON(error);
 
 	return reply;
@@ -1329,10 +1355,15 @@ static int brc_br_bridge_setup(struct vport *vport, int add)
 	if (!vport)
 		return -EINVAL;
 
-	if (add)
+	if (add) {
+		if(!try_module_get(THIS_MODULE)) {
+			pr_warn("Impossible to increment reference count!\n");
+		}
 		return br_compat_bridge_create(vport->dev, &vport->brcompat_data);
+	}
 	else
 	{
+		module_put(THIS_MODULE);
 		br_compat_multicast_dev_del(vport->brcompat_data);
 		vport->brcompat_data = NULL;
 		return 0;
@@ -1374,6 +1405,7 @@ static int brc_br_port_set_param(struct vport *vport, struct net_device *dev, st
 		return 0;
 
 	dev_hold(dev);
+
 	if (data[IFLA_BRPORT_FAST_LEAVE]) {
 		val = nla_get_u8(data[IFLA_BRPORT_FAST_LEAVE]);
 
@@ -1389,18 +1421,34 @@ static int brc_br_port_set_param(struct vport *vport, struct net_device *dev, st
 		err = br_compat_set_port_flag(vport->brcompat_data, val, BR_MULTICAST_FAST_LEAVE);
 	}
 
+	if (data[IFLA_BRPORT_MODE]) {
+		val = nla_get_u8(data[IFLA_BRPORT_MODE]);
+
+		err = brc_set_ulong_val_cmd(dev, BRC_GENL_C_SET_PORT_HAIRPIN_MODE, val);
+		if (err)
+			goto err;
+
+		if (unlikely((dev->priv_flags & IFF_OVS_DATAPATH) == 0)) {
+			err = -ENODEV;
+			goto err;
+		}
+
+		err = br_compat_set_port_flag(vport->brcompat_data, val, BR_HAIRPIN_MODE);
+	}
+
 err:
 	dev_put(dev);
 	return err;
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,13,0)
-static int brc_br_port_slave_changelink(struct net_device *brdev,
+static int brc_br_port_slave_changelink(struct vport *vport,
+				    struct net_device *brdev,
 				    struct net_device *dev,
 				    struct nlattr *tb[],
 				    struct nlattr *data[])
 {
-	return brc_br_port_set_param(NULL, dev, data);
+	return brc_br_port_set_param(vport, dev, data);
 }
 static int br_validate(struct nlattr *tb[], struct nlattr *data[])
 {
@@ -1432,13 +1480,14 @@ static int br_port_slave_changelink(struct net_device *brdev, struct net_device 
 	return br_compat_link_ops.slave_changelink(brdev, dev, tb, data);
 }
 #else
-static int brc_br_port_slave_changelink(struct net_device *brdev,
+static int brc_br_port_slave_changelink(struct vport *vport,
+				    struct net_device *brdev,
 				    struct net_device *dev,
 				    struct nlattr *tb[],
 				    struct nlattr *data[],
 				    struct netlink_ext_ack *extack)
 {
-	return brc_br_port_set_param(NULL, dev, data);
+	return brc_br_port_set_param(vport, dev, data);
 }
 static int br_validate(struct nlattr *tb[], struct nlattr *data[],
 		       struct netlink_ext_ack *extack)
@@ -1768,7 +1817,7 @@ static int __init brc_init(void)
 	ovs_dp_br_changelink_hook = brc_br_changelink;
 
 	/* Set the openvswitch br_port_slave_changelink handler */
-	// ovs_dp_br_port_slave_changelink_hook = brc_br_port_slave_changelink;
+	ovs_dp_br_port_slave_changelink_hook = brc_br_port_slave_changelink;
 
 	/* Set the openvswitch br_fill_info handler */
 	ovs_dp_br_fill_info_hook = brc_br_fill_info;
@@ -1893,6 +1942,18 @@ static void brc_cleanup(void)
 
 	/* Unregister brc_get_fdb_entries */
 	ovs_get_fdb_entries = NULL;
+
+	ovs_dp_dev_init = NULL;
+
+	ovs_dp_dev_open = NULL;
+
+	ovs_dp_dev_stop = NULL;
+
+	ovs_dp_dev_set_mtu_set_by_user = NULL;
+
+	ovs_dp_multicast_add_group = NULL;
+
+	ovs_dp_multicast_del_group = NULL;
 
 	/* Back the hook of the linux bridge to socket module */
 	brioctl_set(bridge_ioctl_hook);

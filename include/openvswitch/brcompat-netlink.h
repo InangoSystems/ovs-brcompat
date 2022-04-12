@@ -144,6 +144,7 @@ enum brc_genl_command {
     BRC_GENL_C_SET_MAC_ADDR, /* K: Set MAC address. */
     BRC_GENL_C_SET_MTU, /* K: Set MTU. */
     BRC_GENL_C_SET_PORT_MC_SNOOPING_FLOOD_REPORTS, /* K: Set the port multicast snooping flood reports */
+    BRC_GENL_C_SET_PORT_HAIRPIN_MODE,   /* K: Set hairpin mode for the port */
 
     __BRC_GENL_C_MAX,
     BRC_GENL_C_MAX = __BRC_GENL_C_MAX - 1

@@ -1701,6 +1701,10 @@ brc_recv_update(void)
     case BRC_GENL_C_SET_MTU:
         handle_set_ulong_val_interface_cmd(&buffer, "mtu_request");
         break;
+
+    case BRC_GENL_C_SET_PORT_HAIRPIN_MODE:
+        handle_set_boolean_val_port_cmd(&buffer, "other-config:hairpin-mode");
+        break;
     /* } seamless-ovs */
 
     default:
