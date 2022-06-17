@@ -60,7 +60,6 @@ do_start_brcompatd () {
 start_brcompatd () {
     if test X"$OVS_BRCOMPATD" = Xyes; then
         do_start_brcompatd || return 1
-        touch /tmp/inangoplug_started
     fi
 
     return 0
@@ -70,7 +69,6 @@ stop_brcompatd () {
     if test X"$OVS_BRCOMPATD" = Xyes; then
         stop_daemon ovs-brcompatd
         remove_kmods
-        rm -f /tmp/inangoplug_started
     fi
 }
 

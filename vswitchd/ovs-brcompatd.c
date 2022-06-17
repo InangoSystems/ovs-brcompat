@@ -111,6 +111,12 @@ static char *vsctl_program;
 
 /* Options that we should generally pass to ovs-vsctl. */
 #define VSCTL_OPTIONS "--timeout=5", "-vconsole:warn"
+#define MAC_ADDR_CONFIG "other-config:hwaddr=+" ETH_ADDR_FMT
+#define MAC_ADDR_ASSIGNMENT_STRLEN (sizeof(MAC_ADDR_CONFIG) + ETH_ADDR_STRLEN + 1)
+#define FORMAT_MAC_ADDRESS_ASSIGNMENT(mac_addr, assignment) {\
+  snprintf(assignment, sizeof(assignment), MAC_ADDR_CONFIG, ETH_ADDR_BYTES_ARGS(mac_addr));  \
+}
+
 
 /* Netlink socket to bridge compatibility kernel module. */
 static struct nl_sock *brc_sock;
@@ -297,7 +303,7 @@ brc_open(struct nl_sock **sock)
 
 static int
 parse_command(struct ofpbuf *buffer, uint32_t *seq, const char **br_name,
-              const char **port_name, uint64_t *count, uint64_t *skip, uint64_t *ulong_param)
+              const char **port_name, uint64_t *count, uint64_t *skip, uint64_t *ulong_param, const char **mac_addr)
 {
     static const struct nl_policy policy[] = {
         [BRC_GENL_A_DP_NAME] = { .type = NL_A_STRING, .optional = true },
@@ -305,6 +311,7 @@ parse_command(struct ofpbuf *buffer, uint32_t *seq, const char **br_name,
         [BRC_GENL_A_FDB_COUNT] = { .type = NL_A_U64, .optional = true },
         [BRC_GENL_A_FDB_SKIP] = { .type = NL_A_U64, .optional = true },
         [BRC_GENL_A_ULONG_VAL] = { .type = NL_A_U64, .optional = true },
+        [BRC_GENL_A_MAC_ADDR] = { .type = NL_A_UNSPEC, .optional = true },
     };
     struct nlattr *attrs[ARRAY_SIZE(policy)];
 
@@ -333,6 +340,9 @@ parse_command(struct ofpbuf *buffer, uint32_t *seq, const char **br_name,
     }
     if (ulong_param) {
         *ulong_param = nl_attr_get_u64(attrs[BRC_GENL_A_ULONG_VAL]);
+    }
+    if (mac_addr && attrs[BRC_GENL_A_MAC_ADDR]) {
+        *mac_addr = nl_attr_get_unspec(attrs[BRC_GENL_A_MAC_ADDR], ETH_ALEN);
     }
     return 0;
 }
@@ -448,49 +458,6 @@ parse_command_mg(struct ofpbuf *buffer, uint32_t *seq, const char **br_name,
     return 0;
 }
 
-static int
-parse_command_mac_addr(struct ofpbuf *buffer, uint32_t *seq, const char **br_name,
-                 const char **port_name, const char **value)
-{
-    static const struct nl_policy policy[] = {
-        [BRC_GENL_A_DP_NAME]      = { .type = NL_A_STRING, .optional = true },
-        [BRC_GENL_A_PORT_NAME]    = { .type = NL_A_STRING, .optional = true },
-        [BRC_GENL_A_MAC_ADDR]     = { .type = NL_A_UNSPEC, .optional = true },
-    };
-    struct nlattr  *attrs[ARRAY_SIZE(policy)];
-
-    VLOG_DBG("parse_command_mac_addr()");
-
-    if (!nl_policy_parse(buffer, NLMSG_HDRLEN + GENL_HDRLEN, policy, attrs, ARRAY_SIZE(policy))
-        || (br_name   && !attrs[BRC_GENL_A_DP_NAME])
-        || (port_name && !attrs[BRC_GENL_A_PORT_NAME])
-        || (value     && !attrs[BRC_GENL_A_MAC_ADDR])
-    ) 
-    {
-        VLOG_ERR("parse_command_mac_addr: nl_policy_parse() failed or some attributes are missing");
-        return EINVAL;
-    }
-
-    *seq = ((struct nlmsghdr *) buffer->data)->nlmsg_seq;
-    VLOG_DBG("parse_command_mac_addr: got seq");
-
-    if (br_name) {
-        *br_name = nl_attr_get_string(attrs[BRC_GENL_A_DP_NAME]);
-        VLOG_DBG("parse_command_mac_addr: got br_name");
-    }
-
-    if (port_name) {
-        *port_name = nl_attr_get_string(attrs[BRC_GENL_A_PORT_NAME]);
-        VLOG_DBG("parse_command_mac_addr: got port");
-    }
-
-    if (value) {
-        *value = nl_attr_get_unspec(attrs[BRC_GENL_A_MAC_ADDR], ETH_ALEN);
-        VLOG_DBG("parse_command_mac_addr: got mac");
-    }
-
-    return 0;
-}
 /* } seamless-ovs */
 
 /* Composes and returns a reply to a request made by the datapath with error
@@ -549,17 +516,32 @@ static int
 handle_bridge_cmd(struct ofpbuf *buffer, bool add)
 {
     const char *br_name;
+    const unsigned char *mac_addr = NULL;
     uint32_t seq;
     int error;
+    int vsctl_ok;
 
-    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL);
+    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL, (const char **)&mac_addr);
     if (!error) {
         const char *vsctl_cmd = add ? "add-br" : "del-br";
         const char *brctl_cmd = add ? "addbr" : "delbr";
-        if (!run_vsctl(vsctl_program, VSCTL_OPTIONS,
-                       "--", vsctl_cmd, br_name,
-                       "--", "comment", "ovs-brcompatd:", brctl_cmd, br_name,
-                       (char *) NULL)) {
+
+        if (mac_addr) {
+            char assignment[MAC_ADDR_ASSIGNMENT_STRLEN];
+            FORMAT_MAC_ADDRESS_ASSIGNMENT(mac_addr, assignment);
+
+            vsctl_ok = run_vsctl(vsctl_program, VSCTL_OPTIONS,
+                        "--", vsctl_cmd, br_name,
+                        "--", "set", "bridge", br_name, assignment,
+                        "--", "comment", "ovs-brcompatd:", brctl_cmd, br_name,
+                        (char *) NULL);
+        } else {
+            vsctl_ok = run_vsctl(vsctl_program, VSCTL_OPTIONS,
+                        "--", vsctl_cmd, br_name,
+                        "--", "comment", "ovs-brcompatd:", brctl_cmd, br_name,
+                        (char *) NULL);
+        }
+        if (!vsctl_ok) {
             error = add ? EEXIST : ENXIO;
         } else {
             if(!on_bridge_add_del(add, br_name)) {
@@ -579,15 +561,17 @@ handle_port_cmd(struct ofpbuf *buffer, bool add)
     const char *br_name, *port_name;
     uint32_t seq;
     int error;
+    int vsctl_ok;
 
-    error = parse_command(buffer, &seq, &br_name, &port_name, NULL, NULL, NULL);
+    error = parse_command(buffer, &seq, &br_name, &port_name, NULL, NULL, NULL, NULL);
     if (!error) {
         const char *vsctl_cmd = add ? "add-port" : "del-port";
         const char *brctl_cmd = add ? "addif" : "delif";
-        if (!run_vsctl(vsctl_program, VSCTL_OPTIONS,
+        vsctl_ok = run_vsctl(vsctl_program, VSCTL_OPTIONS,
                        "--", vsctl_cmd, br_name, port_name,
                        "--", "comment", "ovs-brcompatd:", brctl_cmd,
-                       br_name, port_name, (char *) NULL)) {
+                       br_name, port_name, (char *) NULL);
+        if (!vsctl_ok) {
             error = EINVAL;
         }
         if (add && !error)
@@ -751,7 +735,7 @@ handle_fdb_query_cmd(struct ofpbuf *buffer)
     int error;
 
     /* Parse the command received from brcompat. */
-    error = parse_command(buffer, &seq, &linux_name, NULL, &count, &skip, NULL);
+    error = parse_command(buffer, &seq, &linux_name, NULL, &count, &skip, NULL, NULL);
     if (error) {
         return error;
     }
@@ -919,7 +903,7 @@ handle_get_bridges_cmd(struct ofpbuf *buffer)
      *
      * The command doesn't actually have any arguments, but we need the
      * sequence number to send the reply. */
-    error = parse_command(buffer, &seq, NULL, NULL, NULL, NULL, NULL);
+    error = parse_command(buffer, &seq, NULL, NULL, NULL, NULL, NULL, NULL);
     if (error) {
         return error;
     }
@@ -943,7 +927,7 @@ handle_get_ports_cmd(struct ofpbuf *buffer)
     int error;
 
     /* Parse Netlink command. */
-    error = parse_command(buffer, &seq, &linux_name, NULL, NULL, NULL, NULL);
+    error = parse_command(buffer, &seq, &linux_name, NULL, NULL, NULL, NULL, NULL);
     if (error) {
         return error;
     }
@@ -973,7 +957,7 @@ handle_get_string_value(struct ofpbuf *buffer, const char *sub_cmd)
      * The command doesn't actually have any arguments, but we need the
      * sequence number to send the reply. */
     /* Parse Netlink command. */
-    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL);
+    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL, NULL);
     if (error) {
         return error;
     }
@@ -1015,7 +999,7 @@ handle_get_bridge_name_value(struct ofpbuf *buffer)
      * The command doesn't actually have any arguments, but we need the
      * sequence number to send the reply. */
     /* Parse Netlink command. */
-    error = parse_command(buffer, &seq, &port_name, NULL, NULL, NULL, NULL);
+    error = parse_command(buffer, &seq, &port_name, NULL, NULL, NULL, NULL, NULL);
     if (error) {
         return error;
     }
@@ -1055,7 +1039,7 @@ handle_get_bridge_exists(struct ofpbuf *buffer)
      * The command doesn't actually have any arguments, but we need the
      * sequence number to send the reply. */
     /* Parse Netlink command. */
-    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL);
+    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL, NULL);
     if (error) {
         return error;
     }
@@ -1080,7 +1064,7 @@ handle_set_ulong_val_cmd(struct ofpbuf *buffer, const char *sub_cmd)
     uint32_t seq;
     int error;
 
-    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, &param);
+    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, &param, NULL);
 
     if (!error) {
         str_other_config = xasprintf("other_config:%s=%"PRIu64, sub_cmd, param);
@@ -1110,7 +1094,7 @@ handle_set_ulong_val_port_cmd(struct ofpbuf *buffer, const char *sub_cmd)
     uint32_t seq;
     int error;
 
-    error = parse_command(buffer, &seq, &pr_name, NULL, NULL, NULL, &param);
+    error = parse_command(buffer, &seq, &pr_name, NULL, NULL, NULL, &param, NULL);
 
     if (!error) {
         str_other_config = xasprintf("other_config:%s=%"PRIu64, sub_cmd, param);
@@ -1140,7 +1124,7 @@ handle_set_ulong_val_interface_cmd(struct ofpbuf *buffer, const char *sub_cmd)
     uint32_t seq;
     int error;
 
-    error = parse_command(buffer, &seq, &pr_name, NULL, NULL, NULL, &param);
+    error = parse_command(buffer, &seq, &pr_name, NULL, NULL, NULL, &param, NULL);
 
     if (!error) {
         str_key_value = xasprintf("%s=%"PRIu64, sub_cmd, param);
@@ -1169,7 +1153,7 @@ handle_set_boolean_val_cmd(struct ofpbuf *buffer, const char *sub_cmd)
     uint32_t seq;
     int error;
 
-    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, &param);
+    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, &param, NULL);
 
     if (!error) {
         str_key_value = xasprintf("%s=%s", sub_cmd, param ? "true" : "false");
@@ -1196,7 +1180,7 @@ handle_set_boolean_val_port_cmd(struct ofpbuf *buffer, const char *sub_cmd)
     uint32_t seq;
     int error;
 
-    error = parse_command(buffer, &seq, &pr_name, NULL, NULL, NULL, &param);
+    error = parse_command(buffer, &seq, &pr_name, NULL, NULL, NULL, &param, NULL);
 
     if (!error) {
         str_key_value = xasprintf("%s=%s", sub_cmd, param ? "true" : "false");
@@ -1223,7 +1207,7 @@ handle_set_mc_router_port_cmd(struct ofpbuf *buffer)
     uint32_t seq;
     int error;
 
-    error = parse_command(buffer, &seq, &br_name, &p_name, &expires, NULL, &ip_type);
+    error = parse_command(buffer, &seq, &br_name, &p_name, &expires, NULL, &ip_type, NULL);
 
     if (!error) {
         str_key_value_type = xasprintf("%"PRIu64, ip_type);
@@ -1245,24 +1229,24 @@ handle_set_mc_router_port_cmd(struct ofpbuf *buffer)
 static int
 handle_set_mac_addr_cmd(struct ofpbuf *buffer)
 {
-    const char  other_config_hwaddr[] = "other-config:hwaddr=+%s";
     const char *br_name;
-    const unsigned char *mac;
-    char        mac_str[3*ETH_ALEN];
-    char        assignment[sizeof(other_config_hwaddr) + sizeof(mac_str)];
+    const unsigned char *mac = NULL;
     uint32_t    seq = 0;
     int         error;
 
     VLOG_DBG("handle_set_mac_addr_cmd()");
 
-    error = parse_command_mac_addr(buffer, &seq, &br_name, NULL, (const char **)&mac);
+    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL, (const char **)&mac);
+    if (!mac) {
+        error = EINVAL;
+    }
 
     if (error) {
         VLOG_ERR("handle_set_mac_addr_cmd(): failed to parse the command: parse_command_mac_addr() -> %d", error);
     }
     else {
-        snprintf(mac_str, sizeof(mac_str), ETH_ADDR_FMT, ETH_ADDR_BYTES_ARGS(mac));
-        snprintf(assignment, sizeof(assignment), other_config_hwaddr, mac_str);
+        char assignment[MAC_ADDR_ASSIGNMENT_STRLEN];
+        FORMAT_MAC_ADDRESS_ASSIGNMENT(mac, assignment);
 
         VLOG_DBG("handle_set_mac_addr_cmd(): %s -- set bridge %s %s\n", vsctl_program, br_name, assignment);
         if (!run_vsctl(vsctl_program, "--no-wait", "--", "set", "bridge", br_name, assignment, (char *) NULL)) {
@@ -1287,7 +1271,7 @@ handle_get_ulong_val_cmd(struct ofpbuf *buffer, const char *sub_cmd)
     struct ofpbuf *reply;
 
     /* Parse Netlink command. */
-    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL);
+    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL, NULL);
     if (error) {
         return error;
     }
@@ -1340,7 +1324,7 @@ handle_get_ulong_val_port_cmd(struct ofpbuf *buffer, const char *sub_cmd)
     struct ofpbuf *reply;
 
     /* Parse Netlink command. */
-    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL);
+    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL, NULL);
     if (error) {
         return error;
     }
@@ -1404,7 +1388,7 @@ handle_get_ulong_val_iface_cmd(struct ofpbuf *buffer, const char *sub_cmd)
     struct ofpbuf *reply;
 
     /* Parse Netlink command. */
-    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL);
+    error = parse_command(buffer, &seq, &br_name, NULL, NULL, NULL, NULL, NULL);
     if (error) {
         return error;
     }
@@ -1444,7 +1428,7 @@ handle_set_mc_snooping_flag_cmd(struct ofpbuf *buffer)
     uint32_t seq;
     int error;
 
-    error = parse_command(buffer, &seq, NULL, NULL, &br_snooping, NULL, &ip_type);
+    error = parse_command(buffer, &seq, NULL, NULL, &br_snooping, NULL, &ip_type, NULL);
 
     if (!error) {
         str_key_value_type = xasprintf("%"PRIu64, ip_type);
