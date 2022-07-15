@@ -241,7 +241,7 @@ static int brc_add_del_bridge_netlink(struct net *net, struct net_device *dev, i
 {
 	int err;
 	rtnl_unlock();
-	if (dev->addr_assign_type == NET_ADDR_SET) {
+	if ((add == BRC_GENL_C_DP_ADD) && (dev->addr_assign_type == NET_ADDR_SET)) {
 		err = brc_add_del_bridge(net, dev, dev->name, dev->dev_addr, add);
 	} else {
 		err = brc_add_del_bridge(net, dev, dev->name, NULL, add);
