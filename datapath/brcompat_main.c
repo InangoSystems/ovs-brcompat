@@ -193,11 +193,23 @@ static int brc_add_del_bridge(struct net *net, struct net_device *dev,
 {
 	struct sk_buff *request;
 	int result;
+	struct net_device tmp_dev;
+	tmp_dev.name[0] = '\0';
 
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 
-	request = brc_make_request(add, name, NULL);
+	if (add == BRC_GENL_C_DP_ADD) {
+		result = dev_get_valid_name(net, &tmp_dev, name);
+		if (result < 0) {
+			return result;
+		}
+	}
+	else {
+		strlcpy(tmp_dev.name, name, IFNAMSIZ);
+	}
+
+	request = brc_make_request(add, tmp_dev.name, NULL);
 	if (!request)
 		return -ENOMEM;
 #ifdef CONFIG_LTQ_MCAST_SNOOPING
@@ -206,7 +218,7 @@ static int brc_add_del_bridge(struct net *net, struct net_device *dev,
 #endif
 
 	if (mac && nla_put(request, BRC_GENL_A_MAC_ADDR, ETH_ALEN, mac)) {
-		printk(KERN_ERR "Can't provide MAC address configuration into OVS (dev=\"%s\", mac=%pM )\n", name, mac);
+		printk(KERN_ERR "Can't provide MAC address configuration into OVS (dev=\"%s\", mac=%pM )\n", tmp_dev.name, mac);
 		kfree_skb(request);
 		return -ENOMEM;
 	}
@@ -217,7 +229,7 @@ static int brc_add_del_bridge(struct net *net, struct net_device *dev,
 	netlink_dev = dev;
 
 	mutex_lock(&brc_name_lock);
-	strcpy(bridge_name, name);
+	strcpy(bridge_name, tmp_dev.name);
 	mutex_unlock(&brc_name_lock);
 
 	result = brc_send_simple_command(net, request);
@@ -896,6 +908,8 @@ static int brc_dev_mac_addr(struct net_device *dev, void *p)
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 
+	up_write(&dev_addr_sem);
+	rtnl_unlock();
 	/* Here we suppose that there shouldn't be extensive contention on locking 
 	 * brc_addbr_lock - we'll aquire it soon */
 	for (;;) {
@@ -912,7 +926,8 @@ static int brc_dev_mac_addr(struct net_device *dev, void *p)
 			 * ovs bridge.
 			 */
 			mutex_unlock(&brc_name_lock);
-			return 0;
+			err = 0;
+			goto out;
 		}
 
 		/* mac is for some bridge which is not in process of addition - lets try to lock 
@@ -924,24 +939,24 @@ static int brc_dev_mac_addr(struct net_device *dev, void *p)
 	/* We acquired the brc_addbr_lock - we can send mac to userspace safely */
 	request = brc_make_request(BRC_GENL_C_SET_MAC_ADDR, dev->name, NULL);
 	if (!request) {
-		mutex_unlock(&brc_addbr_lock);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto out_failure;
 	}
 
-	if (nla_put(request, BRC_GENL_A_MAC_ADDR, ETH_ALEN, addr->sa_data))
-		goto brc_dev_mac_addr_put_failure;
+	if (nla_put(request, BRC_GENL_A_MAC_ADDR, ETH_ALEN, addr->sa_data)) {
+		kfree_skb(request);
+		err = -ENOMEM;
+		goto out_failure;
+	}
 
-	rtnl_unlock();
 	err = brc_send_simple_command(dev_net(dev), request);
+
+out_failure:
+	mutex_unlock(&brc_addbr_lock);
+out:
 	rtnl_lock();
-
-	mutex_unlock(&brc_addbr_lock);
+	down_write(&dev_addr_sem);
 	return err;
-
-brc_dev_mac_addr_put_failure:
-	mutex_unlock(&brc_addbr_lock);
-	kfree_skb(request);
-	return -ENOMEM;
 }
 
 /* Called with the rtnl_lock. */
