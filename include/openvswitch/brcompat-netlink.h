@@ -146,6 +146,9 @@ enum brc_genl_command {
     BRC_GENL_C_SET_PORT_MC_SNOOPING_FLOOD_REPORTS, /* K: Set the port multicast snooping flood reports */
     BRC_GENL_C_SET_PORT_HAIRPIN_MODE,   /* K: Set hairpin mode for the port */
 
+    /* Event handlers */
+    BRC_GENL_C_NETDEV_UNREGISTER, /* K: NETDEV_UNREGISTER event handler */
+
     __BRC_GENL_C_MAX,
     BRC_GENL_C_MAX = __BRC_GENL_C_MAX - 1
 };

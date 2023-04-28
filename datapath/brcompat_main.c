@@ -739,6 +739,28 @@ nla_put_failure:
 	return -ENOMEM;
 }
 
+static int brc_set_ulong_val_cmd_sync(struct net_device *dev, int oper, unsigned long param)
+{
+	struct sk_buff *request;
+	int err;
+
+	ASSERT_RTNL();
+
+	request = brc_make_request(oper, dev->name, NULL);
+	if (!request)
+		return -ENOMEM;
+	if (nla_put_u64_64bit(request, BRC_GENL_A_ULONG_VAL, param, BRC_GENL_A_PAD))
+		goto nla_put_failure;
+
+	err = brc_send_simple_command(dev_net(dev), request);
+
+	return err;
+
+nla_put_failure:
+	kfree_skb(request);
+	return -ENOMEM;
+}
+
 static int brc_get_ulong_val_cmd(struct net_device *dev, int oper, unsigned long *uvalue)
 {
 	return brc_get_ulong_val_cmd_with_net(dev_net(dev), dev->name, oper, uvalue);
@@ -1453,6 +1475,8 @@ static int brc_br_port_setup(struct vport *br_vport, struct vport *vport, int ad
 	}
 	else
 	{
+		if (!vport->brcompat_data)
+			return 0;
 		br_compat_multicast_disable_port(vport->brcompat_data);
 		br_compat_multicast_del_port(vport->brcompat_data);
 		vport->brcompat_data = NULL;
@@ -1847,6 +1871,19 @@ nla_put_failure:
 }
 #endif
 
+static int brc_handle_event(struct net_device *dev, unsigned long event)
+{
+	switch (event)
+	{
+	case NETDEV_UNREGISTER:
+		return brc_set_ulong_val_cmd_sync(dev, BRC_GENL_C_NETDEV_UNREGISTER, 0);
+	default:
+		pr_warn("wrong event in brc_handle_event\n");
+	}
+
+	return -EINVAL;
+}
+
 void br_dev_setup(struct net_device *dev)
 {
 	if (check_bridge_list(dev->name) && br_ovs_link_ops->setup)
@@ -1973,6 +2010,9 @@ static int __init brc_init(void)
 	/* Set the openvswitch br_setlink handler */
 	ovs_dp_br_setlink_hook = brc_br_setlink;
 
+	/* Set the openvswitch handle_event handler */
+	brc_handle_event_hook = brc_handle_event;
+
 	/* Set the br_compat br_get_mtu_set_by_user handler */
 	br_compat_get_bridge_hook = brc_br_get_bridge;
 
@@ -2077,6 +2117,9 @@ static void brc_cleanup(void)
 
 	/* Unregister br_setlink hooks */
 	ovs_dp_br_setlink_hook = NULL;
+
+	/* Unregister handle_event hooks */
+	brc_handle_event_hook = NULL;
 
 	/* set the openvswitch linux bridge struct handler */
 	ovs_dp_br_bridge_setup = NULL;
