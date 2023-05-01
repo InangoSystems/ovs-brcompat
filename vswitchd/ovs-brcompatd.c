@@ -1199,6 +1199,28 @@ handle_set_boolean_val_port_cmd(struct ofpbuf *buffer, const char *sub_cmd)
 }
 
 static int
+handle_del_port_no_wait_cmd(struct ofpbuf *buffer)
+{
+    const char *pr_name;
+    uint32_t seq;
+    int error;
+
+    error = parse_command(buffer, &seq, &pr_name, NULL, NULL, NULL, NULL, NULL);
+
+    if (!error) {
+
+        if (!run_vsctl(vsctl_program, VSCTL_OPTIONS, "--no-wait",
+                       "--", "del-port", pr_name,
+                       "--", "comment", "del-port:",
+                       pr_name, "Disap", (char *) NULL)) {
+            error = EINVAL;
+        }
+        send_simple_reply(seq, error);
+    }
+    return error;
+}
+
+static int
 handle_set_mc_router_port_cmd(struct ofpbuf *buffer)
 {
     const char *br_name, *p_name;
@@ -1689,6 +1711,10 @@ brc_recv_update(void)
     case BRC_GENL_C_SET_PORT_HAIRPIN_MODE:
         handle_set_boolean_val_port_cmd(&buffer, "other-config:hairpin-mode");
         break;
+
+    case BRC_GENL_C_NETDEV_UNREGISTER:
+        handle_del_port_no_wait_cmd(&buffer);
+        break;
     /* } seamless-ovs */
 
     default:
@@ -1701,40 +1727,9 @@ error:
     ofpbuf_uninit(&buffer);
 }
 
-static void
-netdev_changed_cb(const struct rtnetlink_change *change,
-                  void *aux OVS_UNUSED)
-{
-    char br_name[IFNAMSIZ];
-    const char *port_name;
-
-    if (!change) {
-        VLOG_WARN_RL(&rl, "network monitor socket overflowed");
-        return;
-    }
-
-    if (change->nlmsg_type != RTM_DELLINK || !change->master_ifindex) {
-        return;
-    }
-
-    port_name = change->ifname;
-    if (!if_indextoname(change->master_ifindex, br_name)) {
-        return;
-    }
-
-    VLOG_INFO("network device %s destroyed, removing from bridge %s",
-              port_name, br_name);
-
-    run_vsctl(vsctl_program, VSCTL_OPTIONS,
-              "--", "--if-exists", "del-port", port_name,
-              "--", "comment", "ovs-brcompatd:", port_name, "disappeared",
-              (char *) NULL);
-}
-
 int
 main(int argc, char *argv[])
 {
-    struct nln_notifier *link_notifier;
     struct unixctl_server *unixctl;
     int retval;
 
@@ -1761,8 +1756,6 @@ main(int argc, char *argv[])
                    "\"brcompat\" kernel module.");
     }
 
-    link_notifier = rtnetlink_notifier_create(netdev_changed_cb, NULL);
-
     daemonize_complete();
 
     for (;;) {
@@ -1778,8 +1771,6 @@ main(int argc, char *argv[])
         netdev_wait();
         poll_block();
     }
-
-    rtnetlink_notifier_destroy(link_notifier);
 
     return 0;
 }
